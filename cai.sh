@@ -43,7 +43,7 @@ KP_DIR="$STATE/khoi-phuc-cli"
 
 # Mã băm ghim (dung-cai-dat.sh thay hai chữ giữ chỗ khi dựng repo cai-dat). Còn chữ giữ chỗ = bản chép từ repo mã (máy thử): chỉ
 # chạy khi JEISTU_CAI_THU=1.
-GHIM_KY_SH="aa05bb00fb0dcd8774d2c04648ab827f427470fd348cf6fbd213690252713c97"
+GHIM_KY_SH="c978b1ea67bfd62535d35f55ab8e08f2cef26865cef8242b3e3c7fb6a6f5cd58"
 GHIM_COSIGN_PUB="d400003ead61da0f8701221df3cd76c22b3448e42aa3177f235559e0896ec019"
 ghim() {   # ghim <tệp> <sha256 ghim> <tên>
   local got; got="$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)"

@@ -55,12 +55,42 @@ ky_cosign() {
   printf '%s' "$bin"
 }
 
+# Lý do lỗi gần nhất của ky_keo / ky_kiem_tep cho bộ cập nhật báo đúng (dashboard tách "mạng chặn" với "sai chữ ký"):
+#   mang_chan = không mở được HTTPS tới kho image (tường lửa / DNS chặn) · kho = tới được kho nhưng kho không cho tải (token
+#   hết hạn / bị thu hồi, image không còn) · chu_ky = chữ ký sai / thiếu · nap_lech = image nạp tay không khớp danh sách ký ·
+#   nap_thieu = bản nạp tay chưa đủ (có bằng chứng mà máy chưa có image / thiếu tệp chữ ký) · cosign = thiếu công cụ hoặc khoá
+#   kiểm chữ ký (cosign tải từ github.com không được). Rỗng = chưa có lỗi.
+KY_LY_DO=""
+KY_NAP_THIEU=""   # ky_nap_kiem: 1 = bằng chứng khớp nhưng máy chưa có image
+
+# ky_kho_toi_duoc : 0 = CHÍNH kho image trả lời /v2/ (header Docker-Distribution-API-Version, hoặc WWW-Authenticate: Bearer — kho
+# OCI trả 401 kèm header này); 1 = không kết nối được, hoặc trả lời là trang chặn của bộ lọc web công ty (403 / 302 không có header
+# của kho) — cả hai đều là "mạng chặn", không phải token.
+ky_kho_toi_duoc() {
+  local host scheme=https hdr
+  host="$(ky_kho)"; host="${host%%/*}"
+  [ "${#KY_INSECURE[@]}" -gt 0 ] && scheme=http
+  hdr="$(curl -s -o /dev/null -D - --connect-timeout 8 --max-time 10 "$scheme://$host/v2/" 2>/dev/null)" || true
+  hdr="${hdr//$'\r'/}"
+  grep -qiE '^(docker-distribution-api-version:|www-authenticate: *bearer)' <<< "$hdr"
+}
+
+# ky_ly_do_keo : sau khi không kéo được từ kho → đặt KY_LY_DO là mang_chan hoặc kho.
+ky_ly_do_keo() { if ky_kho_toi_duoc; then KY_LY_DO=kho; else KY_LY_DO=mang_chan; fi; }
+
+# ky_nap_co <ref@sha256> : 0 = máy có bằng chứng nạp tay (index.json) cho ref này.
+ky_nap_co() {
+  local hex="${1##*@sha256:}" d
+  while IFS= read -r d; do [ -f "$d/$hex/index.json" ] && return 0; done < <(ky_nap_thu_muc)
+  return 1
+}
+
 # ky_kiem_image <ref@sha256> : 0 = chữ ký đúng khoá của chủ. Image phải đã kéo được (cosign đọc chữ ký từ kho).
 ky_kiem_image() {
   local ref="$1" pub cos
   ky_ref_hop_le "$ref" || return 1
-  pub="$(ky_pub)"; [ -s "$pub" ] || { ky_loi "thiếu khoá công khai $pub"; return 1; }
-  cos="$(ky_cosign)" || return 1
+  pub="$(ky_pub)"; [ -s "$pub" ] || { KY_LY_DO=cosign; ky_loi "thiếu khoá công khai $pub"; return 1; }
+  cos="$(ky_cosign)" || { KY_LY_DO=cosign; return 1; }
   if DOCKER_CONFIG="$KY_DOCKER_CONFIG" "$cos" verify ${KY_INSECURE[@]+"${KY_INSECURE[@]}"} --key "$pub" --insecure-ignore-tlog=true "$ref" >/dev/null 2>&1; then return 0; fi
   ky_loi "CHỮ KÝ SAI hoặc thiếu cho $ref — không chạy image này"
   return 1
@@ -69,9 +99,10 @@ ky_kiem_image() {
 # ky_kiem_tep <tệp> <bundle> : 0 = tệp đúng chữ ký của chủ.
 ky_kiem_tep() {
   local f="$1" b="$2" pub cos
-  pub="$(ky_pub)"; [ -s "$pub" ] || { ky_loi "thiếu khoá công khai $pub"; return 1; }
-  [ -s "$f" ] && [ -s "$b" ] || { ky_loi "thiếu tệp hoặc chữ ký: $f"; return 1; }
-  cos="$(ky_cosign)" || return 1
+  pub="$(ky_pub)"; [ -s "$pub" ] || { KY_LY_DO=cosign; ky_loi "thiếu khoá công khai $pub"; return 1; }
+  # Thiếu tệp chữ ký: thường là bản nạp tay chép chưa đủ (vẫn từ chối; câu báo nhắc "không phải bạn chép thì báo người quản trị").
+  [ -s "$f" ] && [ -s "$b" ] || { KY_LY_DO=nap_thieu; ky_loi "thiếu tệp hoặc chữ ký: $f"; return 1; }
+  cos="$(ky_cosign)" || { KY_LY_DO=cosign; return 1; }
   if "$cos" verify-blob --key "$pub" --insecure-ignore-tlog=true --bundle "$b" "$f" >/dev/null 2>&1; then return 0; fi
   ky_loi "CHỮ KÝ SAI cho $(basename "$f") — không dùng"
   return 1
@@ -100,6 +131,7 @@ ky_chip() { case "$(uname -m)" in x86_64|amd64) echo amd64 ;; aarch64|arm64) ech
 # ky_nap_kiem <ref@sha256> : 0 = image đang có trên máy đúng là image danh sách ký chỉ tới. Ghi tên chạy được vào KY_NAP_DA_KIEM.
 ky_nap_kiem() {
   local ref="$1" hex repo tag d idx man mt mdig cfg id ten=""
+  KY_NAP_THIEU=""
   ky_ref_hop_le "$ref" || return 1
   hex="${ref##*@sha256:}"; repo="${ref%@*}"; tag="$repo:nap-${hex:0:12}"
   while IFS= read -r d; do
@@ -126,7 +158,7 @@ ky_nap_kiem() {
       install -d -m 750 "$KY_NAP_DA_KIEM"; printf '%s\n' "$ten" > "$KY_NAP_DA_KIEM/$hex"
       return 0
     done
-    ky_loi "đã có bằng chứng nạp tay cho $ref nhưng máy chưa có image (chạy lại Nap-image trên Mac)"; return 1
+    KY_NAP_THIEU=1; ky_loi "đã có bằng chứng nạp tay cho $ref nhưng máy chưa có image (chạy lại Nap-image trên Mac)"; return 1
   done < <(ky_nap_thu_muc)
   return 1
 }
@@ -148,15 +180,27 @@ ky_anh_chay() {
 # Image VỪA kéo từ kho mà chữ ký sai thì KHÔNG có đường lùi này.
 ky_keo() {
   local ref="$1" had=0
-  ky_ref_hop_le "$ref" || return 1
+  KY_LY_DO=""
+  ky_ref_hop_le "$ref" || { KY_LY_DO=chu_ky; return 1; }
   rm -f "$KY_NAP_DA_KIEM/${ref##*@sha256:}" 2>/dev/null || true
   docker image inspect "$ref" >/dev/null 2>&1 && had=1
   if [ "$had" = 0 ] && ! DOCKER_CONFIG="$KY_DOCKER_CONFIG" docker pull -q "$ref" >/dev/null 2>&1; then
     if ky_nap_kiem "$ref"; then echo "[ky] $ref: image nạp tay, khớp danh sách phát hành đã ký (chuỗi digest)" >&2; return 0; fi
-    ky_loi "không kéo được $ref (token đọc image hết hạn / bị thu hồi, hoặc mạng chặn ghcr.io:443; máy không tải được image: Nap-image trên Mac)"; return 1
+    if ky_nap_co "$ref"; then if [ -n "$KY_NAP_THIEU" ]; then KY_LY_DO=nap_thieu; else KY_LY_DO=nap_lech; fi; return 1; fi   # ky_nap_kiem đã ghi lý do
+    ky_ly_do_keo
+    if [ "$KY_LY_DO" = mang_chan ]; then ky_loi "không kéo được $ref: máy KHÔNG tới được kho image $(ky_kho) qua 443 (mạng / tường lửa chặn) — nhờ IT mở, hoặc Nap-image trên Mac"
+    else ky_loi "không kéo được $ref: kho image $(ky_kho) tới được nhưng không cho tải (token đọc image hết hạn / bị thu hồi, hoặc image không còn)"; fi
+    return 1
   fi
   if ! ky_kiem_image "$ref"; then
     if [ "$had" = 1 ] && ky_nap_kiem "$ref"; then echo "[ky] $ref: image nạp tay, khớp danh sách phát hành đã ký (chuỗi digest)" >&2; return 0; fi
+    if [ "$KY_LY_DO" != cosign ]; then
+      # Image có sẵn trên máy mà kho không đọc được chữ ký: phân biệt mạng chặn với chữ ký sai thật. Image vẫn bị TỪ CHỐI ở mọi
+      # nhánh (return 1); mạng chặn thì không kiểm được chữ ký, nên câu báo là "mạng chặn", không phải "image tốt".
+      if [ "$had" = 1 ] && ky_nap_co "$ref"; then KY_LY_DO=nap_lech
+      elif [ "$had" = 1 ] && ! ky_kho_toi_duoc; then KY_LY_DO=mang_chan
+      else KY_LY_DO=chu_ky; fi
+    fi
     [ "$had" = 1 ] || docker image rm -f "$ref" >/dev/null 2>&1 || true
     return 1
   fi
