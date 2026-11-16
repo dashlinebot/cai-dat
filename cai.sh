@@ -130,6 +130,25 @@ kiem_dia() {   # kiem_dia <GB cần cho thư mục nặng>: in một dòng cho m
   return "$loi"
 }
 
+# G128 (G127 GĐ1): máy có ổ dữ liệu riêng gắn (bind) vào /home (sổ tay vận hành docs/OPERATIONS.md, mục 15): phiên systemd --user của
+# user bot (user@<uid>.service, chạy lúc khởi động nhờ linger) chỉ được chạy khi /home ĐÃ gắn — ổ dữ liệu không lên thì bot không chạy
+# trên /home rỗng của ổ hệ thống. Chỉ đặt cho uid của user bot (root và user khác không bị ảnh hưởng). /home không phải điểm gắn
+# riêng: không làm gì. Gọi TRƯỚC linger (bật linger là user@ khởi động ngay).
+SYSTEMD_DIR="${JEISTU_SYSTEMD_DIR:-/etc/systemd/system}"
+DROPIN_TEN=g127-o-du-lieu.conf
+drop_in_home() {   # drop_in_home <user>
+  local u="$1" uid d f want
+  if ! mountpoint -q /home 2>/dev/null; then xanh "/home nằm trên ổ hệ thống: không cần lớp chặn ổ dữ liệu cho $u"; return 0; fi
+  uid="$(id -u "$u" 2>/dev/null)" || dung "không thấy tài khoản $u"
+  d="$SYSTEMD_DIR/user@$uid.service.d"; f="$d/$DROPIN_TEN"
+  want="$(printf '# G127: dịch vụ systemd --user của bot chỉ chạy khi /home (ổ dữ liệu) đã gắn\n[Unit]\nRequiresMountsFor=/home\n')"
+  if [ -f "$f" ] && [ "$(cat "$f")" = "$want" ]; then xanh "lớp chặn ổ dữ liệu cho $u (user@$uid) đã có"; return 0; fi
+  install -d -m 755 "$d"
+  printf '%s\n' "$want" > "$f.moi" && chmod 644 "$f.moi" && mv -f "$f.moi" "$f" || dung "không ghi được $f"
+  systemctl daemon-reload || dung "systemctl daemon-reload lỗi sau khi thêm $f"
+  xanh "/home là ổ dữ liệu riêng: dịch vụ của $u (user@$uid) chỉ chạy khi /home đã gắn ($f)"
+}
+
 kiem_may() {
   buoc "Kiểm máy"
   local loi=0 id ver gb p
@@ -223,6 +242,7 @@ nen_may() {
   # lúc đó (thêm sau thì dashboard không mở được socket cho tới khi user@ khởi động lại).
   getent group jeistu-tro-ly >/dev/null || groupadd --system jeistu-tro-ly
   id -nG "$SVC_USER" | tr ' ' '\n' | grep -x jeistu-tro-ly >/dev/null || usermod -aG jeistu-tro-ly "$SVC_USER"
+  drop_in_home "$SVC_USER"
   loginctl enable-linger "$SVC_USER"
   case "$(timedatectl show -p Timezone --value 2>/dev/null)" in Etc/UTC|UTC) timedatectl set-timezone Asia/Ho_Chi_Minh 2>/dev/null && xanh "múi giờ Asia/Ho_Chi_Minh" ;; esac
 }
