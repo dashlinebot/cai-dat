@@ -40,6 +40,8 @@ LOGF=/var/log/jeistu-cai.log
 TT="$STATE/trang-thai.json"
 CHANG="kiem nen ky ma tro-ly router bot tuong-lua xong"
 KP_DIR="$STATE/khoi-phuc-cli"
+# G127: thư mục lớn dần (image Docker — kho containerd với Docker ≥ 29 —, dữ liệu + sao lưu bot dưới /home của user dịch vụ).
+THU_MUC_NANG="/var/lib/docker /var/lib/containerd /home"
 
 # Mã băm ghim (dung-cai-dat.sh thay hai chữ giữ chỗ khi dựng repo cai-dat). Còn chữ giữ chỗ = bản chép từ repo mã (máy thử): chỉ
 # chạy khi JEISTU_CAI_THU=1.
@@ -91,9 +93,46 @@ tien_do() { local n=0 c; for c in $CHANG; do da_xong "$c" && n=$((n + 1)); done;
 # ============================================================================================================
 # Chặng 1: kiểm máy (chỉ đọc). Lỗi nào cũng một câu tiếng Việt + cách sửa.
 # ============================================================================================================
+# G127: đo chỗ trống theo Ổ CHỨA từng thư mục nặng, không chỉ "/". Máy có ổ dữ liệu riêng gắn (bind) vào các thư mục này thì đo ổ
+# đó; ổ hệ thống khi ấy chỉ cần CAN_GOC_GB (gói hệ thống, Docker, bản chép mã root — ĐÃ TỰ QUYẾT 5 GB).
+CAN_GOC_GB=5
+o_chua() {   # o_chua <thư mục>: "<nguồn> <điểm gắn> <GB trống>" của ổ chứa thư mục (chưa có thì thư mục cha gần nhất)
+  local p="$1"
+  while [ ! -e "$p" ] && [ "$p" != / ]; do p="$(dirname "$p")"; done
+  # df căn cột bằng nhiều dấu cách (vd "/dev/sda1      /            11G"): tách bằng awk, chỉ bỏ chữ G ở cột chỗ trống.
+  df -BG --output=source,target,avail "$p" 2>/dev/null | awk 'NR > 1 {d = $1; t = $2; a = $3} END {sub(/G$/, "", a); if (d != "") print d, t, a}'
+}
+kiem_dia() {   # kiem_dia <GB cần cho thư mục nặng>: in một dòng cho mỗi ổ, trả 1 nếu thiếu chỗ
+  local can="$1" loi=0 d src="" tgt="" av="" ds="" rieng=0 bang="" g_src="" g_tgt="" g_av=""
+  read -r g_src g_tgt g_av < <(o_chua /) || true
+  for d in $THU_MUC_NANG; do
+    src="" tgt="" av=""
+    read -r src tgt av < <(o_chua "$d") || true
+    [[ "$av" =~ ^[0-9]+$ ]] || { vang "không đo được chỗ trống của ổ chứa $d"; loi=1; continue; }
+    [ "$src" = "$g_src" ] || rieng=1
+    bang+="$src $av $d"$'\n'
+  done
+  # Gộp theo ổ: các thư mục cùng một ổ dùng chung chỗ trống → một dòng, kể đủ thư mục.
+  while read -r src av ds; do
+    [ -n "$src" ] || continue
+    if [ "$av" -ge "$can" ]; then xanh "ổ $src (chứa $ds) trống ${av} GB"
+    elif [ "$src" = "$g_src" ]; then
+      vang "ổ hệ thống $src (chứa $ds) còn ${av} GB: cần ít nhất ${can} GB trống. Nhờ IT nới ổ hệ thống; hoặc nếu máy có thêm ổ dữ liệu riêng thì dời các thư mục này sang ổ đó TRƯỚC khi cài (sổ tay vận hành docs/OPERATIONS.md, mục 15 \"Máy có ổ dữ liệu riêng\")"; loi=1
+    else
+      vang "ổ $src (chứa $ds) còn ${av} GB: cần ít nhất ${can} GB trống. Nhờ IT nới ổ này (sổ tay vận hành docs/OPERATIONS.md, mục 15 \"Máy có ổ dữ liệu riêng\")"; loi=1
+    fi
+  done < <(printf '%s' "$bang" | awk '!($1 in a) {o[++n] = $1; v[$1] = $2; a[$1] = $3; next} {a[$1] = a[$1] ", " $3}
+                                     END {for (i = 1; i <= n; i++) print o[i], v[o[i]], a[o[i]]}')
+  if [ "$rieng" = 1 ]; then
+    if [[ ! "$g_av" =~ ^[0-9]+$ ]] || [ "$g_av" -lt "$CAN_GOC_GB" ]; then vang "ổ hệ thống / còn ${g_av:-?} GB: cần ít nhất ${CAN_GOC_GB} GB trống (gói hệ thống, Docker, bản chép mã)"; loi=1
+    else xanh "ổ hệ thống / trống ${g_av} GB"; fi
+  fi
+  return "$loi"
+}
+
 kiem_may() {
   buoc "Kiểm máy"
-  local loi=0 id ver gb free p
+  local loi=0 id ver gb p
   . /etc/os-release 2>/dev/null || true
   id="${ID:-?}"; ver="${VERSION_ID:-?}"
   case "$id:$ver" in ubuntu:24.04|ubuntu:26.04) xanh "Ubuntu $ver" ;; *) vang "máy là ${PRETTY_NAME:-?}: bộ cài chỉ thử trên Ubuntu 24.04 / 26.04"; loi=1 ;; esac
@@ -101,13 +140,12 @@ kiem_may() {
   [ "$(ps -p 1 -o comm= 2>/dev/null)" = systemd ] && xanh "systemd đang chạy" || { vang "không có systemd (máy ảo / container đặc biệt?)"; loi=1; }
   gb="$(awk '/^MemTotal:/ {printf "%d", $2 / 1048576 + 0.5}' /proc/meminfo)"
   if [ "$gb" -lt 4 ]; then vang "RAM ${gb} GB: cần ít nhất 4 GB (8 GB nếu chạy từ 2 tài khoản trở lên)"; loi=1; else xanh "RAM ${gb} GB"; fi
-  free="$(df -BG --output=avail / | tail -1 | tr -dc 0-9)"
   # Máy mới: 30 GB (router, model nhúng, image ~10 GB + dữ liệu). Thêm bản cài trên máy đã có bot: image dùng chung, 10 GB đủ.
   # BỔ SUNG 2 (thử ngắt giữa chừng): chạy lại sau khi đã qua chặng nền — phần đã cài chiếm sẵn đĩa, chỉ cần 10 GB cho phần còn lại.
   local can=30; { [ -n "$THEM" ] || da_xong nen; } && can=10
   # Chỉ máy thử (bản cai.sh chưa ghim, JEISTU_CAI_THU=1): đĩa chung của máy thử không đủ 30 GB trống.
   [ "${JEISTU_CAI_THU:-}" = 1 ] && [[ "${JEISTU_CAI_DIA_GB:-}" =~ ^[0-9]+$ ]] && can="$JEISTU_CAI_DIA_GB"
-  if [ "$free" -lt "$can" ]; then vang "đĩa / còn ${free} GB: cần ít nhất ${can} GB trống"; loi=1; else xanh "đĩa trống ${free} GB"; fi
+  kiem_dia "$can" || loi=1
   if command -v snap >/dev/null && snap list docker >/dev/null 2>&1; then vang "Docker đang cài bằng snap: gỡ trước (sudo snap remove docker) rồi chạy lại"; loi=1; fi
   p=20128
   if ss -ltnH "sport = :$p" 2>/dev/null | grep . >/dev/null && ! docker inspect jeistu-router >/dev/null 2>&1; then vang "cổng $p đang có chương trình khác nghe (router cần cổng này)"; loi=1; fi
@@ -319,6 +357,18 @@ lay_ma() {
     else vang "không lấy được add-on (token không có quyền repo add-on?) — cài lõi trước, thêm add-on sau"; ADDON_DIR=""; fi
   fi
   xanh "mã bot $tag ($commit) — khớp danh sách"
+  kiem_hermes_ghim "$REL" "$ROOT_MA"
+}
+
+# G124 BỔ SUNG 5: commit Hermes trong danh sách đã ký phải trùng commit mã bot ghim (deploy/ubuntu/lib/hermes-ghim.sh của ĐÚNG bản
+# vừa lấy). install.sh còn kiểm lại commit thật của bản Hermes tải về. Danh sách cũ (≤ 3.8.x) không có trường này: chỉ install.sh kiểm.
+kiem_hermes_ghim() {   # kiem_hermes_ghim <danh sách> <thư mục mã bot>
+  local ds ma
+  ds="$(jq -r '.hermes.commit // ""' "$1")"
+  [ -n "$ds" ] || { vang "danh sách không ghi commit Hermes (bản cũ) — bộ cài bot tự kiểm commit Hermes"; return 0; }
+  ma="$(bash -c '. "$1" && printf %s "$HERMES_COMMIT"' _ "$2/deploy/ubuntu/lib/hermes-ghim.sh" 2>/dev/null)"
+  [ "$ds" = "$ma" ] || dung "Hermes trong danh sách phát hành (${ds:0:12}) khác bản mã bot ghim (${ma:-không đọc được}) — dừng, không cài"
+  xanh "Hermes $(jq -r .hermes.tag "$1") @ ${ds:0:12} — khớp danh sách"
 }
 
 # ============================================================================================================
