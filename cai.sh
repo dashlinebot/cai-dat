@@ -202,14 +202,25 @@ hoi_token() {
 # ============================================================================================================
 # BỔ SUNG 2 (thử ngắt giữa chừng): bị giết lúc dpkg đang cài thì gói nằm dở ("in a mess" / "unpacked but not configured") và apt từ
 # chối chạy tiếp. Chữa trước mỗi chặng dùng apt: cấu hình nốt, cài lại gói hỏng (gói tải lại từ kho, không đoán).
+# G131 A10: như install.sh — apt tự tải lại phần bị cắt; hỏng thì thử lại một lần --fix-missing; vẫn hỏng thì dừng, câu nói rõ.
+APT_OPTS=(-o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60)
+APT_DUNG="mạng cắt khi tải gói hệ thống (apt) — gõ lại đúng lệnh cài là làm tiếp"
+apt_cai() {   # apt_cai <gói…> (im lặng, -qq)
+  apt-get "${APT_OPTS[@]}" install -y -qq "$@" >/dev/null && return 0
+  vang "tải gói bị ngắt — thử lại một lần (--fix-missing)"
+  apt-get "${APT_OPTS[@]}" update -qq || true
+  apt-get "${APT_OPTS[@]}" install -y -qq --fix-missing "$@" >/dev/null || dung "$APT_DUNG"
+}
+apt_capnhat() { apt-get "${APT_OPTS[@]}" update -qq || { vang "lấy danh sách gói bị ngắt — thử lại một lần"; apt-get "${APT_OPTS[@]}" update -qq || dung "$APT_DUNG"; }; }
+
 chua_apt() {
   [ -n "$(dpkg --audit 2>/dev/null)" ] || return 0
   vang "lần trước bị ngắt giữa lúc cài gói — đang chữa (dpkg --configure -a, cài lại gói hỏng)"
   dpkg --configure -a >/dev/null 2>&1 || true
   local hong; hong="$(dpkg --audit 2>/dev/null | sed -n 's/^ \([a-z0-9][a-z0-9.+:-]*\) .*/\1/p' | sort -u | tr '\n' ' ')"
   # shellcheck disable=SC2086
-  [ -z "$hong" ] || apt-get install -y -qq --reinstall $hong >/dev/null 2>&1 || true
-  apt-get install -f -y -qq >/dev/null 2>&1 || true
+  [ -z "$hong" ] || apt-get "${APT_OPTS[@]}" install -y -qq --reinstall $hong >/dev/null 2>&1 || true
+  apt-get "${APT_OPTS[@]}" install -f -y -qq >/dev/null 2>&1 || true
   [ -z "$(dpkg --audit 2>/dev/null)" ] || dung "gói hệ thống vẫn hỏng sau khi chữa: sudo dpkg --configure -a && sudo apt-get install -f, rồi chạy lại lệnh cài"
   xanh "đã chữa gói cài dở"
 }
@@ -217,8 +228,8 @@ chua_apt() {
 nen_may() {
   buoc "Nền máy: gói hệ thống, Docker, tài khoản dịch vụ"
   chua_apt
-  apt-get update -qq
-  apt-get install -y -qq git curl ca-certificates gnupg jq openssl ufw acl sqlite3 unzip >/dev/null
+  apt_capnhat
+  apt_cai git curl ca-certificates gnupg jq openssl ufw acl sqlite3 unzip
   if ! command -v docker >/dev/null || ! docker compose version >/dev/null 2>&1; then
     install -d -m 0755 /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -226,8 +237,8 @@ nen_may() {
     . /etc/os-release
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin >/dev/null
+    apt_capnhat
+    apt_cai docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     systemctl enable --now docker >/dev/null
   fi
   docker info >/dev/null 2>&1 || dung "Docker cài xong nhưng chưa chạy (systemctl status docker)"
@@ -291,7 +302,7 @@ ky_va_danh_sach() {
 # ============================================================================================================
 mo_ban_sao_luu() {
   buoc "Mở bản sao lưu"
-  command -v age >/dev/null || apt-get install -y -qq age >/dev/null || dung "không cài được age (apt)"
+  command -v age >/dev/null || apt_cai age
   # Giải + mở ngay (cần biết bản bot TRƯỚC khi chọn danh sách phát hành); kiểm mã băm từng phần + router ở khoi-phuc.sh mo sau khi
   # có bản chép root của mã (cai-dat chỉ mang cai.sh + lib/ky.sh + cosign.pub).
   if [ ! -s "$KP_DIR/OFFSITE.json" ]; then
@@ -439,6 +450,8 @@ cai_bot() {
       [ ! -s "$uh/.config/jeistu/khoa-router/openviking-$KENH-$THEM" ] || echo "OV_VLM_API_KEY_FILE=$uh/.config/jeistu/khoa-router/openviking-$KENH-$THEM"
     fi
     echo "TZ=Asia/Ho_Chi_Minh"
+    # G131 A7: bộ cài bot chạy dưới cai.sh — không in link thiết lập / bước tiếp theo riêng (cai.sh in MỘT link cuối lượt).
+    echo "DUOI_CAI=1"
   } > "$conf"
   # umask 077 chỉ cho tệp câu trả lời; bộ cài chạy với umask thường (khoá apt, thư mục hệ thống phải đọc được).
   umask 022
@@ -448,8 +461,9 @@ cai_bot() {
   if [ -n "${ROOT_ADDON:-}" ]; then
     # Bản root của add-on là nguồn gộp (không có kenh.env cạnh script): --kenh. addon-system.sh chạy bằng root chỉ làm phần hệ thống
     # (bubblewrap, AppArmor) rồi dừng; phần còn lại (Chromium vào HOME, ghi .env của Hermes) chạy DƯỚI user bot từ bản của user.
-    [ ! -f "$ROOT_ADDON/deploy/ubuntu/addon-system.sh" ] || bash "$ROOT_ADDON/deploy/ubuntu/addon-system.sh" --kenh "$KENH" || vang "addon-system.sh (phần hệ thống) báo lỗi"
-    [ ! -f "$ROOT_ADDON/deploy/ubuntu/studio-system.sh" ] || bash "$ROOT_ADDON/deploy/ubuntu/studio-system.sh" || vang "studio-system.sh báo lỗi"
+    [ ! -f "$ROOT_ADDON/deploy/ubuntu/addon-system.sh" ] || JEISTU_NGUOI_BOT="$SVC_USER" bash "$ROOT_ADDON/deploy/ubuntu/addon-system.sh" --kenh "$KENH" || vang "addon-system.sh (phần hệ thống) báo lỗi"
+    # G131 A7: tài khoản bot để studio-system.sh kiểm systemd --user đúng người (root không có phiên user).
+    [ ! -f "$ROOT_ADDON/deploy/ubuntu/studio-system.sh" ] || JEISTU_NGUOI_BOT="$SVC_USER" bash "$ROOT_ADDON/deploy/ubuntu/studio-system.sh" || vang "studio-system.sh báo lỗi"
     if [ -f "$ADDON_DIR/deploy/ubuntu/addon-system.sh" ]; then
       sudo -H -u "$SVC_USER" env XDG_RUNTIME_DIR="/run/user/$(id -u "$SVC_USER")" PATH="$uh/.local/bin:/usr/local/bin:/usr/bin:/bin" \
         bash -c 'cd "$1" && bash deploy/ubuntu/addon-system.sh --kenh "$2"' _ "$ADDON_DIR" "$KENH" || vang "addon-system.sh (phần của user bot) báo lỗi"
@@ -463,6 +477,8 @@ cai_bot() {
   {
     echo "USER=$SVC_USER"; echo "BOT_DIR=$BOT_DIR"; echo "KENH=$KENH"; echo "ENV_PREFIX=$pre"
     echo "SVC_ENV=$uh/$home_k/services/compose.env"; echo "COMPOSE_FILE=$BOT_DIR/kenh/$KENH/docker-compose.yml"
+    # G131 A6: bản nguồn add-on của bộ cài (chạy addon-system.sh phần user) — bộ cập nhật đưa nó lên đúng bản của danh sách.
+    [ -z "${ADDON_DIR:-}" ] || echo "ADDON_DIR=$ADDON_DIR"
     # Cổng ra ngoài của bản cài (đọc MỘT lần ngay sau khi bộ cài của root vừa ghi .env), chỉ nhận số.
     sed -n "s/^${pre}\(DASHBOARD_PORT\|ROUTER_FORWARD_PORT\)=\([0-9]\{4,5\}\)\$/\1=\2/p" "$BOT_DIR/.env" | sort -u
     # Cổng chuyển tiếp router: .env không ghi thì là mặc định của kênh (kenh.env của bản root).
@@ -489,17 +505,19 @@ tuong_lua() {
   fi
   for p in $ports; do ufw allow "$p/tcp" comment "SSH" >/dev/null; done
   # Cổng lấy từ sổ bản cài của ROOT (ban-cai.d, ghi lúc cài), không từ .env của user bot; kiểm dạng số + khoảng.
-  local f
+  local f k dash="" rt=""
   for f in "$ETC"/ban-cai.d/*.env; do
     [ -f "$f" ] || continue
-    for p in $(sed -n 's/^\(DASHBOARD_PORT\|ROUTER_FORWARD_PORT\)=\([0-9]\{4,5\}\)$/\2/p' "$f"); do
+    while IFS='=' read -r k p; do
       [ "$p" -ge 1024 ] && [ "$p" -le 65535 ] && [ "$p" != 20128 ] || continue
       if [ -n "$from" ]; then ufw allow from "$from" to any port "$p" proto tcp comment "jeistu" >/dev/null; else ufw allow "$p/tcp" comment "jeistu" >/dev/null; fi
-    done
+      # G131 A7: câu báo liệt kê ĐỦ cổng đã mở (trước đây chỉ "SSH 22, dashboard" dù có mở cổng trang router).
+      case "$k" in DASHBOARD_PORT) dash="${dash:+$dash, }$p" ;; ROUTER_FORWARD_PORT) rt="${rt:+$rt, }$p" ;; esac
+    done < <(sed -n -E 's/^(DASHBOARD_PORT|ROUTER_FORWARD_PORT)=([0-9]{4,5})$/\1=\2/p' "$f")
   done
   ufw --force enable >/dev/null
   systemd-run --quiet --unit jeistu-ufw-hen-gio --on-active=10min /usr/sbin/ufw --force disable 2>/dev/null || true
-  xanh "ufw bật: SSH $(echo $ports | tr ' ' ','), dashboard; tự TẮT sau 10 phút nếu chưa mở trang thiết lập (phòng khoá ngoài)"
+  xanh "ufw bật: SSH $(echo $ports | tr ' ' ', ')${dash:+, dashboard $dash}${rt:+, trang router $rt (chỉ nghe Tailscale + máy này)}; tự TẮT sau 10 phút nếu chưa mở trang thiết lập (phòng khoá ngoài)"
 }
 
 # ============================================================================================================
@@ -534,7 +552,7 @@ main_flow() {
   kiem_may
   [ "$CHECK" = 1 ] && { xanh "chỉ kiểm (--check): không đổi gì"; return 0; }
   # Ubuntu cài mới không có jq: tệp trạng thái (làm tiếp khi chạy lại) cần nó ngay từ đây.
-  command -v jq >/dev/null || { apt-get update -qq && apt-get install -y -qq jq >/dev/null; } || dung "không cài được jq (apt)"
+  command -v jq >/dev/null || { apt_capnhat && apt_cai jq; }
   danh_dau kiem
   if [ -z "$KENH" ]; then
     KENH="$(jq -r '.kenh // ""' "$TT")"
@@ -578,7 +596,7 @@ main_flow() {
   danh_dau xong
   if [ -n "$KHOI_PHUC" ]; then
     printf '\n\033[32m✔ Đã cài và khôi phục từ bản sao lưu.\033[0m Mở dashboard (cổng như máy cũ) và đăng nhập bằng TÀI KHOẢN DASHBOARD CŨ;\n'
-    printf '  kênh cần đăng nhập lại thì trang hiện mã QR. Mật khẩu trang router: mật khẩu cũ. Tắt hẳn máy cũ (không để hai máy chạy một phiên).\n'
+    printf '  kênh cần đăng nhập lại thì trang Tài khoản của kênh chỉ cách. Mật khẩu trang router: mật khẩu cũ. Tắt hẳn máy cũ (không để hai máy chạy một phiên).\n'
     return 0
   fi
   local link
