@@ -427,9 +427,16 @@ router() {
 # ============================================================================================================
 # Chặng 7: bot — install.sh của bản ROOT, cài vào thư mục mã của user dịch vụ, câu trả lời sinh tự động (không nano).
 # ============================================================================================================
+# G133: lựa chọn mở dashboard trong mạng nội bộ của bản cài này: sổ bản cài đã có → giữ (thiếu dòng = máy cũ = 1); bản cài mới → 0.
+lan_ban_cai() {
+  local f="$ETC/ban-cai.d/${THEM:-chinh}.env" v
+  if [ -f "$f" ]; then v="$(sed -n 's/^DASHBOARD_LAN=\([01]\)$/\1/p' "$f" | tail -n 1)"; printf '%s' "${v:-1}"; else printf '0'; fi
+}
 cai_bot() {
   buoc "Bot Jeistu kênh $KENH"
   local conf ip uh
+  # G133: lựa chọn mở LAN đọc MỘT lần, TRƯỚC mọi khối ghi tệp (chuyển hướng "> tệp" cắt rỗng tệp trước khi chạy khối — rà /code-review).
+  local lan; lan="$(lan_ban_cai)"
   uh="$(getent passwd "$SVC_USER" | cut -d: -f6)"
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)"
   conf="$ETC/install-${THEM:-chinh}.conf"
@@ -438,6 +445,9 @@ cai_bot() {
     echo "INSTALL_USER=$SVC_USER"
     echo "BOT_DIR=$BOT_DIR"
     echo "DASHBOARD_IP=${ip:-127.0.0.1}"
+    # G133 mục 3: bản cài MỚI chỉ mở dashboard qua Tailscale + trên máy (DASHBOARD_LAN=0); bản cài đang có (chạy lại "sửa lỗi cài") giữ
+    # lựa chọn đã ghi trong sổ bản cài, máy cũ chưa ghi = mở mạng nội bộ như trước (install.sh chỉ ghi .env khi chưa có).
+    echo "DASHBOARD_LAN=$lan"
     echo "ENABLE_UFW=0"
     echo "ENABLE_OPENVIKING=1"
     echo "UPDATE_TOKEN_FILE=$uh/.config/jeistu/github-token"
@@ -475,7 +485,7 @@ cai_bot() {
   home_k="$(sed -n "s/^KENH_HOME_DIR=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p" "$ROOT_MA/kenh/$KENH/kenh.env" | head -1)"
   install -d -m 755 "$ETC/ban-cai.d"
   {
-    echo "USER=$SVC_USER"; echo "BOT_DIR=$BOT_DIR"; echo "KENH=$KENH"; echo "ENV_PREFIX=$pre"
+    echo "USER=$SVC_USER"; echo "BOT_DIR=$BOT_DIR"; echo "KENH=$KENH"; echo "ENV_PREFIX=$pre"; echo "DASHBOARD_LAN=$lan"
     echo "SVC_ENV=$uh/$home_k/services/compose.env"; echo "COMPOSE_FILE=$BOT_DIR/kenh/$KENH/docker-compose.yml"
     # G131 A6: bản nguồn add-on của bộ cài (chạy addon-system.sh phần user) — bộ cập nhật đưa nó lên đúng bản của danh sách.
     [ -z "${ADDON_DIR:-}" ] || echo "ADDON_DIR=$ADDON_DIR"
@@ -492,6 +502,14 @@ cai_bot() {
 # Chặng 8: tường lửa — tự nhận cổng SSH (sshd -T + phiên đang nối), mở trước rồi mới bật; hẹn giờ tự tắt 10 phút, trang
 # thiết lập mở được = mạng còn vào được → hẹn giờ huỷ (không cần cửa sổ SSH thứ hai).
 # ============================================================================================================
+co_tailscale() { ip link show tailscale0 >/dev/null 2>&1 || command -v tailscale >/dev/null 2>&1; }
+# lan_cong <sổ bản cài> <cổng>: lựa chọn chủ đổi ở Bảo trì (dashboard-lan.conf) thắng; không có → sổ bản cài; máy cũ → 1.
+lan_cong() {
+  local v=""
+  [ -r "$ETC/dashboard-lan.conf" ] && v="$(sed -n "s/^$2=\([01]\)\$/\1/p" "$ETC/dashboard-lan.conf" | tail -n 1)"
+  [ -n "$v" ] || v="$(sed -n 's/^DASHBOARD_LAN=\([01]\)$/\1/p' "$1" | tail -n 1)"
+  printf '%s' "${v:-1}"
+}
 tuong_lua() {
   buoc "Tường lửa"
   local ports p from=""
@@ -510,6 +528,13 @@ tuong_lua() {
     [ -f "$f" ] || continue
     while IFS='=' read -r k p; do
       [ "$p" -ge 1024 ] && [ "$p" -le 65535 ] && [ "$p" != 20128 ] || continue
+      # G133 mục 3: cổng dashboard chỉ qua Tailscale (sổ bản cài DASHBOARD_LAN=0, chủ đổi ở Bảo trì → dashboard-lan.conf): chỉ tailscale0.
+      # Máy CHƯA có Tailscale: dashboard vẫn nghe như cũ (nghe-dashboard.js) → mở như cũ, không thì không vào được trang thiết lập và
+      # hẹn giờ tự tắt ufw (rà độc lập G133). Cài Tailscale sau: chủ bấm "Chỉ mở qua Tailscale" ở Bảo trì để đóng cổng LAN.
+      if [ "$k" = DASHBOARD_PORT ] && [ "$(lan_cong "$f" "$p")" = 0 ] && co_tailscale; then
+        ufw allow in on tailscale0 to any port "$p" proto tcp comment "jeistu tailscale" >/dev/null
+        dash="${dash:+$dash, }$p (chỉ Tailscale)"; continue
+      fi
       if [ -n "$from" ]; then ufw allow from "$from" to any port "$p" proto tcp comment "jeistu" >/dev/null; else ufw allow "$p/tcp" comment "jeistu" >/dev/null; fi
       # G131 A7: câu báo liệt kê ĐỦ cổng đã mở (trước đây chỉ "SSH 22, dashboard" dù có mở cổng trang router).
       case "$k" in DASHBOARD_PORT) dash="${dash:+$dash, }$p" ;; ROUTER_FORWARD_PORT) rt="${rt:+$rt, }$p" ;; esac
